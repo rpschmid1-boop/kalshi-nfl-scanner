@@ -35,39 +35,29 @@ export default async function handler(req, res) {
 
         const data = await response.json();
 
-        const returnedMarkets = data.markets || [];
-
         markets.push(
-          ...returnedMarkets.map((m) => ({
+          ...(data.markets || []).map((m) => ({
             type,
-
             ticker: m.ticker,
             eventTicker: m.event_ticker,
-
             title: m.title,
             subtitle: m.subtitle,
-
             yesSubtitle: m.yes_sub_title,
             noSubtitle: m.no_sub_title,
-
             status: m.status,
 
-            yesBid: m.yes_bid_dollars,
-            yesAsk: m.yes_ask_dollars,
+            yesBid: Number(m.yes_bid_dollars || 0),
+            yesAsk: Number(m.yes_ask_dollars || 0),
+            noBid: Number(m.no_bid_dollars || 0),
+            noAsk: Number(m.no_ask_dollars || 0),
 
-            noBid: m.no_bid_dollars,
-            noAsk: m.no_ask_dollars,
+            lastPrice: Number(m.last_price_dollars || 0),
 
-            lastPrice: m.last_price_dollars,
+            volume: Number(m.volume_fp || 0),
+            volume24h: Number(m.volume_24h_fp || 0),
+            openInterest: Number(m.open_interest_fp || 0),
 
-            volume: m.volume_fp,
-            volume24h: m.volume_24h_fp,
-            openInterest: m.open_interest_fp,
-            liquidity: m.liquidity_dollars,
-
-            openTime: m.open_time,
             closeTime: m.close_time,
-            expirationTime: m.expected_expiration_time,
           }))
         );
 
@@ -77,44 +67,99 @@ export default async function handler(req, res) {
         if (pages >= 10) break;
       } while (cursor);
 
-      return {
-        seriesTicker,
-        type,
-        pages,
-        count: markets.length,
-        markets,
-      };
+      return markets;
     }
 
-    // Fetch ML, spreads and totals simultaneously
     const results = await Promise.all(
       series.map((s) => getSeriesMarkets(s.ticker, s.type))
     );
 
-    const allMarkets = results.flatMap((r) => r.markets);
+    const allMarkets = results.flat();
 
-    // Sort by closing time so upcoming games appear first
-    allMarkets.sort((a, b) => {
-      return new Date(a.closeTime) - new Date(b.closeTime);
-    });
+    const games = {};
+
+    for (const m of allMarkets) {
+      /*
+       * Strip the contract-specific suffix and keep
+       * the underlying game identifier.
+       *
+       * Examples:
+       * KXNFLGAME-26SEP10SFLAR-SF
+       * KXNFLSPREAD-26SEP10SFLAR-SF7
+       * KXNFLTOTAL-26SEP10SFLAR-45
+       *
+       * all map to:
+       * 26SEP10SFLAR
+       */
+
+      const match = m.eventTicker?.match(
+        /^KXNFL(?:GAME|SPREAD|TOTAL)-(.+)$/
+      );
+
+      if (!match) continue;
+
+      const gameId = match[1];
+
+      if (!games[gameId]) {
+        games[gameId] = {
+          gameId,
+          title: null,
+          closeTime: m.closeTime,
+          moneyline: [],
+          spreads: [],
+          totals: [],
+        };
+      }
+
+      const game = games[gameId];
+
+      if (!game.title && m.title) {
+        game.title = m.title;
+      }
+
+      if (m.type === "moneyline") {
+        game.moneyline.push({
+          ticker: m.ticker,
+          team: m.yesSubtitle,
+          bid: m.yesBid,
+          ask: m.yesAsk,
+          last: m.lastPrice,
+          volume24h: m.volume24h,
+        });
+      }
+
+      if (m.type === "spread") {
+        game.spreads.push({
+          ticker: m.ticker,
+          outcome: m.yesSubtitle,
+          bid: m.yesBid,
+          ask: m.yesAsk,
+          last: m.lastPrice,
+          volume24h: m.volume24h,
+        });
+      }
+
+      if (m.type === "total") {
+        game.totals.push({
+          ticker: m.ticker,
+          outcome: m.yesSubtitle,
+          bid: m.yesBid,
+          ask: m.yesAsk,
+          last: m.lastPrice,
+          volume24h: m.volume24h,
+        });
+      }
+    }
+
+    const groupedGames = Object.values(games)
+      .sort((a, b) => {
+        return new Date(a.closeTime) - new Date(b.closeTime);
+      });
 
     return res.status(200).json({
       success: true,
-
-      counts: {
-        moneyline:
-          results.find((r) => r.type === "moneyline")?.count || 0,
-
-        spread:
-          results.find((r) => r.type === "spread")?.count || 0,
-
-        total:
-          results.find((r) => r.type === "total")?.count || 0,
-
-        all: allMarkets.length,
-      },
-
-      markets: allMarkets,
+      gameCount: groupedGames.length,
+      games: groupedGames,
     });
   } catch (error) {
     console.error(error);
