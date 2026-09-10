@@ -1,7 +1,7 @@
 export default async function handler(req, res) {
   try {
     const response = await fetch(
-      "https://api.elections.kalshi.com/trade-api/v2/markets?limit=1000"
+      "https://api.elections.kalshi.com/trade-api/v2/series?category=Sports"
     );
 
     if (!response.ok) {
@@ -9,19 +9,38 @@ export default async function handler(req, res) {
     }
 
     const data = await response.json();
-    const markets = data.markets || [];
+    const series = data.series || [];
 
-    const sample = markets.slice(0, 50).map((m) => ({
-      ticker: m.ticker,
-      eventTicker: m.event_ticker,
-      title: m.title,
-      subtitle: m.subtitle,
-    }));
+    const football = series
+      .filter((s) => {
+        const text = [
+          s.ticker,
+          s.title,
+          s.category,
+          ...(s.tags || []),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toUpperCase();
+
+        return (
+          text.includes("NFL") ||
+          text.includes("FOOTBALL")
+        );
+      })
+      .map((s) => ({
+        ticker: s.ticker,
+        title: s.title,
+        category: s.category,
+        tags: s.tags,
+        frequency: s.frequency,
+      }));
 
     return res.status(200).json({
       success: true,
-      fetched: markets.length,
-      sample,
+      totalSeries: series.length,
+      footballCount: football.length,
+      football,
     });
   } catch (error) {
     console.error(error);
