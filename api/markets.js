@@ -1,7 +1,17 @@
 export default async function handler(req, res) {
   try {
-    const BASE =
+    /*
+     * Keep the standard NFL feed on the endpoint
+     * we already know is working.
+     *
+     * Use Kalshi's documented public API host for
+     * multivariate collection/event discovery.
+     */
+    const STANDARD_BASE =
       "https://api.elections.kalshi.com/trade-api/v2";
+
+    const MVE_BASE =
+      "https://external-api.kalshi.com/trade-api/v2";
 
     const standardSeries = [
       { ticker: "KXNFLGAME", type: "moneyline" },
@@ -10,13 +20,15 @@ export default async function handler(req, res) {
     ];
 
     /*
-     * Optional query parameters:
+     * Supported calls:
      *
      * /api/markets
      *
      * /api/markets?gameId=26SEP13CHICAR
      *
      * /api/markets?gameId=26SEP13CHICAR&depth=true
+     *
+     * /api/markets?gameId=26SEP13CHICAR&raw=true
      *
      * /api/markets?raw=true
      */
@@ -39,15 +51,71 @@ export default async function handler(req, res) {
     );
 
     function numberOrZero(value) {
-      const number = Number(value);
+      const n = Number(value);
 
-      return Number.isFinite(number)
-        ? number
+      return Number.isFinite(n)
+        ? n
         : 0;
     }
 
     /*
-     * Normalize Kalshi market object.
+     * Simple concurrency helper.
+     */
+    async function mapWithConcurrency(
+      items,
+      concurrency,
+      fn
+    ) {
+      if (!items.length) {
+        return [];
+      }
+
+      const output =
+        new Array(items.length);
+
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const index =
+            nextIndex++;
+
+          if (
+            index >=
+            items.length
+          ) {
+            return;
+          }
+
+          output[index] =
+            await fn(
+              items[index],
+              index
+            );
+        }
+      }
+
+      const workerCount =
+        Math.min(
+          concurrency,
+          items.length
+        );
+
+      await Promise.all(
+        Array.from(
+          {
+            length:
+              workerCount,
+          },
+          () => worker()
+        )
+      );
+
+      return output;
+    }
+
+    /*
+     * Normalize standard Kalshi market objects.
      */
     function normalizeMarket(
       market,
@@ -129,7 +197,7 @@ export default async function handler(req, res) {
           market.expected_expiration_time,
 
         /*
-         * Multivariate / combo metadata.
+         * MVE fields when present.
          */
         mveCollectionTicker:
           market.mve_collection_ticker ||
@@ -142,10 +210,6 @@ export default async function handler(req, res) {
             ? market.mve_selected_legs
             : [],
 
-        customStrike:
-          market.custom_strike ||
-          null,
-
         isProvisional:
           Boolean(
             market.is_provisional
@@ -154,8 +218,8 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Pull all open markets from a normal
-     * Kalshi series.
+     * Pull all open markets from
+     * a standard Kalshi NFL series.
      */
     async function getSeriesMarkets(
       seriesTicker,
@@ -167,7 +231,9 @@ export default async function handler(req, res) {
 
       do {
         const url =
-          new URL(`${BASE}/markets`);
+          new URL(
+            `${STANDARD_BASE}/markets`
+          );
 
         url.searchParams.set(
           "series_ticker",
@@ -211,11 +277,8 @@ export default async function handler(req, res) {
         const data =
           await response.json();
 
-        const pageMarkets =
-          data.markets || [];
-
         markets.push(
-          ...pageMarkets.map(
+          ...(data.markets || []).map(
             (market) =>
               normalizeMarket(
                 market,
@@ -229,12 +292,9 @@ export default async function handler(req, res) {
 
         pages++;
 
-        /*
-         * Safety valve.
-         */
         if (pages >= 10) {
           console.warn(
-            `${seriesTicker}: pagination safety limit reached`
+            `${seriesTicker}: pagination safety cap hit`
           );
 
           break;
@@ -242,149 +302,6 @@ export default async function handler(req, res) {
       } while (cursor);
 
       return markets;
-    }
-
-    /*
-     * Pull open multivariate markets.
-     *
-     * This is the IMPORTANT change.
-     *
-     * Kalshi documents:
-     *
-     * mve_filter=only
-     *
-     * as the proper way to retrieve
-     * multivariate / combo markets.
-     */
-    async function getMVEMarkets(
-      minCloseTs = null,
-      maxCloseTs = null
-    ) {
-      let markets = [];
-      let cursor = null;
-      let pages = 0;
-      let truncated = false;
-
-      do {
-        const url =
-          new URL(`${BASE}/markets`);
-
-        url.searchParams.set(
-          "status",
-          "open"
-        );
-
-        url.searchParams.set(
-          "mve_filter",
-          "only"
-        );
-
-        url.searchParams.set(
-          "limit",
-          "1000"
-        );
-
-        /*
-         * Restrict the scan to the
-         * relevant NFL date window.
-         *
-         * This avoids downloading every
-         * open combo across every sport.
-         */
-        if (minCloseTs) {
-          url.searchParams.set(
-            "min_close_ts",
-            String(minCloseTs)
-          );
-        }
-
-        if (maxCloseTs) {
-          url.searchParams.set(
-            "max_close_ts",
-            String(maxCloseTs)
-          );
-        }
-
-        if (cursor) {
-          url.searchParams.set(
-            "cursor",
-            cursor
-          );
-        }
-
-        const response =
-          await fetch(
-            url.toString(),
-            {
-              headers: {
-                Accept:
-                  "application/json",
-              },
-            }
-          );
-
-        if (!response.ok) {
-          throw new Error(
-            `MVE markets: Kalshi returned ${response.status}`
-          );
-        }
-
-        const data =
-          await response.json();
-
-        const pageMarkets =
-          data.markets || [];
-
-        markets.push(
-          ...pageMarkets.map(
-            (market) =>
-              normalizeMarket(
-                market,
-                "combo"
-              )
-          )
-        );
-
-        cursor =
-          data.cursor || null;
-
-        pages++;
-
-        /*
-         * MVE universe can get large.
-         */
-        if (pages >= 20) {
-          if (cursor) {
-            truncated = true;
-          }
-
-          break;
-        }
-      } while (cursor);
-
-      /*
-       * Deduplicate by ticker.
-       */
-      const uniqueMarkets =
-        Array.from(
-          new Map(
-            markets.map(
-              (market) => [
-                market.ticker,
-                market,
-              ]
-            )
-          ).values()
-        );
-
-      return {
-        markets:
-          uniqueMarkets,
-
-        pages,
-
-        truncated,
-      };
     }
 
     function getMidpoint(
@@ -410,13 +327,12 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Pick strike closest to a
-     * 50/50 market.
+     * Main line = market nearest 50/50.
      */
     function selectMainMarket(
       markets
     ) {
-      const valid =
+      return (
         markets
           .map((market) => {
             const midpoint =
@@ -424,7 +340,7 @@ export default async function handler(req, res) {
                 market
               );
 
-            const bidAskSpread =
+            const spread =
               market.yesAsk > 0 &&
               market.yesBid > 0
                 ? market.yesAsk -
@@ -439,12 +355,12 @@ export default async function handler(req, res) {
               distanceFrom50:
                 midpoint !== null
                   ? Math.abs(
-                      midpoint -
-                      0.5
+                      midpoint - 0.5
                     )
                   : 999,
 
-              bidAskSpread,
+              bidAskSpread:
+                spread,
             };
           })
           .filter(
@@ -479,9 +395,8 @@ export default async function handler(req, res) {
               a.bidAskSpread -
               b.bidAskSpread
             );
-          });
-
-      return valid[0] || null;
+          })[0] || null
+      );
     }
 
     function extractNumber(
@@ -501,15 +416,6 @@ export default async function handler(req, res) {
         : null;
     }
 
-    /*
-     * Event:
-     *
-     * KXNFLSPREAD-26SEP13CHICAR
-     *
-     * becomes:
-     *
-     * 26SEP13CHICAR
-     */
     function extractNFLGameId(
       eventTicker
     ) {
@@ -575,6 +481,10 @@ export default async function handler(req, res) {
           market.yesSubtitle ||
           market.title,
 
+        noOutcome:
+          market.noSubtitle ||
+          null,
+
         line:
           extractNumber(
             market.yesSubtitle ||
@@ -620,9 +530,9 @@ export default async function handler(req, res) {
     }
 
     /*
-     * STEP 1:
+     * STEP 1
      *
-     * Fetch ordinary NFL markets.
+     * Pull normal NFL markets.
      */
     const standardResults =
       await Promise.all(
@@ -638,6 +548,12 @@ export default async function handler(req, res) {
     const standardMarkets =
       standardResults.flat();
 
+    /*
+     * Underlying ticker lookup.
+     *
+     * This lets us translate MVE legs into
+     * human-readable NFL outcomes later.
+     */
     const underlyingByTicker =
       new Map(
         standardMarkets.map(
@@ -649,8 +565,6 @@ export default async function handler(req, res) {
       );
 
     /*
-     * STEP 2:
-     *
      * Group standard markets by NFL game.
      */
     const games = {};
@@ -672,7 +586,8 @@ export default async function handler(req, res) {
         games[gameId] = {
           gameId,
 
-          title: null,
+          title:
+            null,
 
           closeTime:
             market.closeTime,
@@ -698,13 +613,15 @@ export default async function handler(req, res) {
 
       if (
         market.closeTime &&
-        (!game.closeTime ||
+        (
+          !game.closeTime ||
           new Date(
             market.closeTime
           ) <
             new Date(
               game.closeTime
-            ))
+            )
+        )
       ) {
         game.closeTime =
           market.closeTime;
@@ -739,100 +656,464 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Determine which games we're
-     * scanning.
+     * Precompute main spread + total
+     * for each game.
      */
-    let targetGameObjects =
-      Object.values(games);
+    const preparedGames =
+      Object.values(games)
+        .map((game) => ({
+          ...game,
 
-    if (requestedGameId) {
-      targetGameObjects =
-        targetGameObjects.filter(
-          (game) =>
-            game.gameId ===
-            requestedGameId
-        );
-    }
+          mainSpread:
+            selectMainMarket(
+              game.spreads
+            ),
 
-    /*
-     * Build a date window for MVE scan.
-     *
-     * Four days on either side gives
-     * plenty of breathing room while
-     * avoiding every open combo on Kalshi.
-     */
-    const validCloseTimes =
-      targetGameObjects
-        .map(
-          (game) =>
-            new Date(
-              game.closeTime
-            ).getTime()
-        )
+          mainTotal:
+            selectMainMarket(
+              game.totals
+            ),
+        }))
         .filter(
-          (time) =>
-            Number.isFinite(time)
+          (game) =>
+            game.moneyline.length >
+              0
         );
 
-    let minCloseTs = null;
-    let maxCloseTs = null;
+    /*
+     * If gameId supplied, only do
+     * expensive combo discovery for that game.
+     */
+    const comboTargetGames =
+      requestedGameId
+        ? preparedGames.filter(
+            (game) =>
+              game.gameId ===
+              requestedGameId
+          )
+        : preparedGames.filter(
+            (game) =>
+              game.mainSpread &&
+              game.mainTotal
+          );
 
-    if (
-      validCloseTimes.length > 0
+    /*
+     * STEP 2
+     *
+     * Find multivariate collections associated
+     * with an underlying event ticker.
+     *
+     * Kalshi supports:
+     *
+     * GET /multivariate_event_collections
+     * ?status=open
+     * &associated_event_ticker=...
+     */
+    async function getCollectionsForEvent(
+      eventTicker
     ) {
-      const FOUR_DAYS =
-        4 *
-        24 *
-        60 *
-        60 *
-        1000;
+      let collections = [];
+      let cursor = null;
+      let pages = 0;
 
-      const minTime =
-        Math.min(
-          ...validCloseTimes
-        ) - FOUR_DAYS;
+      do {
+        const url =
+          new URL(
+            `${MVE_BASE}/multivariate_event_collections`
+          );
 
-      const maxTime =
-        Math.max(
-          ...validCloseTimes
-        ) + FOUR_DAYS;
-
-      minCloseTs =
-        Math.floor(
-          minTime / 1000
+        url.searchParams.set(
+          "status",
+          "open"
         );
 
-      maxCloseTs =
-        Math.ceil(
-          maxTime / 1000
+        url.searchParams.set(
+          "associated_event_ticker",
+          eventTicker
         );
+
+        url.searchParams.set(
+          "limit",
+          "200"
+        );
+
+        if (cursor) {
+          url.searchParams.set(
+            "cursor",
+            cursor
+          );
+        }
+
+        const response =
+          await fetch(
+            url.toString(),
+            {
+              headers: {
+                Accept:
+                  "application/json",
+              },
+            }
+          );
+
+        if (!response.ok) {
+          throw new Error(
+            `Collections for ${eventTicker}: Kalshi returned ${response.status}`
+          );
+        }
+
+        const data =
+          await response.json();
+
+        collections.push(
+          ...(
+            data.multivariate_contracts ||
+            []
+          )
+        );
+
+        cursor =
+          data.cursor || null;
+
+        pages++;
+
+        if (pages >= 10) {
+          console.warn(
+            `Collection pagination cap hit for ${eventTicker}`
+          );
+
+          break;
+        }
+      } while (cursor);
+
+      return collections;
     }
 
     /*
-     * STEP 3:
+     * Query collections using the spread EVENT,
+     * then verify the collection also contains
+     * the matching total EVENT.
      *
-     * Fetch MVE / combo universe.
+     * This avoids searching Kalshi's entire
+     * multivariate universe.
      */
-    const mveResult =
-      await getMVEMarkets(
-        minCloseTs,
-        maxCloseTs
+    const collectionLookupResults =
+      await mapWithConcurrency(
+        comboTargetGames,
+        8,
+        async (game) => {
+          if (
+            !game.mainSpread ||
+            !game.mainTotal
+          ) {
+            return {
+              gameId:
+                game.gameId,
+
+              collections: [],
+            };
+          }
+
+          const spreadEventTicker =
+            game.mainSpread.eventTicker;
+
+          const totalEventTicker =
+            game.mainTotal.eventTicker;
+
+          const foundCollections =
+            await getCollectionsForEvent(
+              spreadEventTicker
+            );
+
+          /*
+           * Prefer collections whose metadata
+           * explicitly says both NFL events
+           * belong to the collection.
+           */
+          const matchingCollections =
+            foundCollections.filter(
+              (collection) => {
+                const tickers =
+                  Array.isArray(
+                    collection.associated_event_tickers
+                  )
+                    ? collection.associated_event_tickers
+                    : [];
+
+                return (
+                  tickers.includes(
+                    spreadEventTicker
+                  ) &&
+                  tickers.includes(
+                    totalEventTicker
+                  )
+                );
+              }
+            );
+
+          return {
+            gameId:
+              game.gameId,
+
+            spreadEventTicker,
+
+            totalEventTicker,
+
+            queriedCollectionCount:
+              foundCollections.length,
+
+            collections:
+              matchingCollections,
+          };
+        }
       );
 
-    const comboMarkets =
-      mveResult.markets;
+    /*
+     * Map collection diagnostics by game.
+     */
+    const collectionInfoByGame =
+      {};
+
+    for (
+      const result of
+        collectionLookupResults
+    ) {
+      collectionInfoByGame[
+        result.gameId
+      ] = result;
+    }
 
     /*
-     * STEP 4:
+     * Deduplicate collection tickers.
+     */
+    const collectionTickerSet =
+      new Set();
+
+    for (
+      const result of
+        collectionLookupResults
+    ) {
+      for (
+        const collection of
+          result.collections || []
+      ) {
+        if (
+          collection.collection_ticker
+        ) {
+          collectionTickerSet.add(
+            collection.collection_ticker
+          );
+        }
+      }
+    }
+
+    const collectionTickers =
+      Array.from(
+        collectionTickerSet
+      );
+
+    /*
+     * STEP 3
      *
-     * Analyze MVE legs.
+     * Pull multivariate EVENTS only for
+     * relevant collections.
      *
-     * We ONLY want:
+     * with_nested_markets=true makes Kalshi
+     * return each event's actual combo markets,
+     * including mve_selected_legs.
+     */
+    async function getMultivariateEventsForCollection(
+      collectionTicker
+    ) {
+      let events = [];
+      let cursor = null;
+      let pages = 0;
+
+      do {
+        const url =
+          new URL(
+            `${MVE_BASE}/events/multivariate`
+          );
+
+        url.searchParams.set(
+          "collection_ticker",
+          collectionTicker
+        );
+
+        url.searchParams.set(
+          "with_nested_markets",
+          "true"
+        );
+
+        url.searchParams.set(
+          "limit",
+          "200"
+        );
+
+        if (cursor) {
+          url.searchParams.set(
+            "cursor",
+            cursor
+          );
+        }
+
+        const response =
+          await fetch(
+            url.toString(),
+            {
+              headers: {
+                Accept:
+                  "application/json",
+              },
+            }
+          );
+
+        if (!response.ok) {
+          throw new Error(
+            `MVE events for ${collectionTicker}: Kalshi returned ${response.status}`
+          );
+        }
+
+        const data =
+          await response.json();
+
+        events.push(
+          ...(data.events || [])
+        );
+
+        cursor =
+          data.cursor || null;
+
+        pages++;
+
+        /*
+         * Safety cap:
+         * 10 x 200 = 2,000 events per collection.
+         */
+        if (pages >= 10) {
+          console.warn(
+            `MVE event pagination cap hit for ${collectionTicker}`
+          );
+
+          break;
+        }
+      } while (cursor);
+
+      return {
+        collectionTicker,
+
+        events,
+
+        pages,
+      };
+    }
+
+    const collectionEventResults =
+      await mapWithConcurrency(
+        collectionTickers,
+        6,
+        async (
+          collectionTicker
+        ) =>
+          getMultivariateEventsForCollection(
+            collectionTicker
+          )
+      );
+
+    /*
+     * Flatten nested markets.
+     */
+    const nestedComboMarkets = [];
+
+    const multivariateEventDiagnostics =
+      [];
+
+    for (
+      const result of
+        collectionEventResults
+    ) {
+      for (
+        const event of
+          result.events
+      ) {
+        const markets =
+          Array.isArray(
+            event.markets
+          )
+            ? event.markets
+            : [];
+
+        multivariateEventDiagnostics.push({
+          collectionTicker:
+            result.collectionTicker,
+
+          eventTicker:
+            event.event_ticker,
+
+          seriesTicker:
+            event.series_ticker,
+
+          title:
+            event.title,
+
+          category:
+            event.category,
+
+          nestedMarketCount:
+            markets.length,
+        });
+
+        for (
+          const market of
+            markets
+        ) {
+          nestedComboMarkets.push({
+            ...normalizeMarket(
+              market,
+              "combo"
+            ),
+
+            parentCollectionTicker:
+              result.collectionTicker,
+
+            parentMveEventTicker:
+              event.event_ticker,
+
+            parentMveSeriesTicker:
+              event.series_ticker,
+
+            parentMveTitle:
+              event.title,
+
+            parentMveCategory:
+              event.category,
+          });
+        }
+      }
+    }
+
+    /*
+     * Deduplicate nested combo markets.
+     */
+    const comboMarkets =
+      Array.from(
+        new Map(
+          nestedComboMarkets.map(
+            (market) => [
+              market.ticker,
+              market,
+            ]
+          )
+        ).values()
+      );
+
+    /*
+     * STEP 4
      *
-     * - exactly two legs
-     * - one NFL spread
-     * - one NFL total
-     * - both from same game
+     * Identify exact same-game:
+     *
+     * spread + total
+     *
+     * two-leg combos.
      */
     function analyzeCombo(
       market
@@ -854,13 +1135,6 @@ export default async function handler(req, res) {
               leg.market_ticker
             );
 
-          /*
-           * Prefer event ticker supplied
-           * by the MVE leg.
-           *
-           * Fall back to underlying
-           * market if necessary.
-           */
           const eventTicker =
             leg.event_ticker ||
             underlying?.eventTicker ||
@@ -888,12 +1162,6 @@ export default async function handler(req, res) {
             } else if (
               side === "no"
             ) {
-              /*
-               * Kalshi NO subtitles are
-               * not always human-readable,
-               * so keep the exact YES
-               * proposition and label it NO.
-               */
               outcome =
                 `NO: ${
                   underlying.yesSubtitle ||
@@ -947,7 +1215,7 @@ export default async function handler(req, res) {
       }
 
       /*
-       * Must be same NFL game.
+       * Must be the SAME NFL game.
        */
       if (
         !spreadLeg.gameId ||
@@ -968,13 +1236,21 @@ export default async function handler(req, res) {
           market.eventTicker,
 
         collectionTicker:
-          market.mveCollectionTicker,
+          market.mveCollectionTicker ||
+          market.parentCollectionTicker ||
+          null,
+
+        parentMveEventTicker:
+          market.parentMveEventTicker ||
+          null,
+
+        parentMveSeriesTicker:
+          market.parentMveSeriesTicker ||
+          null,
 
         title:
-          market.title,
-
-        subtitle:
-          market.subtitle,
+          market.title ||
+          market.parentMveTitle,
 
         spread: {
           ticker:
@@ -1041,7 +1317,9 @@ export default async function handler(req, res) {
 
     const analyzedCombos =
       comboMarkets
-        .map(analyzeCombo)
+        .map(
+          analyzeCombo
+        )
         .filter(Boolean);
 
     /*
@@ -1065,7 +1343,9 @@ export default async function handler(req, res) {
 
       combosByGame[
         combo.gameId
-      ].push(combo);
+      ].push(
+        combo
+      );
     }
 
     function matchesMainMarkets(
@@ -1089,22 +1369,18 @@ export default async function handler(req, res) {
     }
 
     /*
-     * STEP 5:
+     * STEP 5
      *
-     * Build final game objects.
+     * Build response.
      */
     let cleanGames =
-      Object.values(games)
+      preparedGames
         .map((game) => {
           const mainSpread =
-            selectMainMarket(
-              game.spreads
-            );
+            game.mainSpread;
 
           const mainTotal =
-            selectMainMarket(
-              game.totals
-            );
+            game.mainTotal;
 
           const moneyline =
             game.moneyline
@@ -1160,9 +1436,6 @@ export default async function handler(req, res) {
               ] || []
             ).sort(
               (a, b) => {
-                /*
-                 * Executable markets first.
-                 */
                 if (
                   a.executable !==
                   b.executable
@@ -1179,11 +1452,6 @@ export default async function handler(req, res) {
               }
             );
 
-          /*
-           * Exact combo using the
-           * scanner's main spread +
-           * main total.
-           */
           const mainLineCombos =
             gameCombos.filter(
               (combo) =>
@@ -1194,14 +1462,6 @@ export default async function handler(req, res) {
                 )
             );
 
-          /*
-           * Expected possible keys:
-           *
-           * spread_yes__total_yes
-           * spread_yes__total_no
-           * spread_no__total_yes
-           * spread_no__total_no
-           */
           const quadrantMap = {};
 
           for (
@@ -1212,6 +1472,13 @@ export default async function handler(req, res) {
               combo.quadrantKey
             ] = combo;
           }
+
+          const collectionInfo =
+            collectionInfoByGame[
+              game.gameId
+            ] || {
+              collections: [],
+            };
 
           return {
             gameId:
@@ -1234,6 +1501,51 @@ export default async function handler(req, res) {
               cleanMarket(
                 mainTotal
               ),
+
+            comboDiscovery: {
+              spreadEventTicker:
+                mainSpread?.eventTicker ||
+                null,
+
+              totalEventTicker:
+                mainTotal?.eventTicker ||
+                null,
+
+              queriedCollectionCount:
+                collectionInfo
+                  .queriedCollectionCount ||
+                0,
+
+              matchingCollectionCount:
+                (
+                  collectionInfo.collections ||
+                  []
+                ).length,
+
+              matchingCollections:
+                (
+                  collectionInfo.collections ||
+                  []
+                ).map(
+                  (collection) => ({
+                    collectionTicker:
+                      collection.collection_ticker,
+
+                    seriesTicker:
+                      collection.series_ticker,
+
+                    title:
+                      collection.title,
+
+                    description:
+                      collection.description,
+
+                    associatedEventTickers:
+                      collection.associated_event_tickers ||
+                      [],
+                  })
+                ),
+            },
 
             combos: {
               totalSameGameSpreadTotal:
@@ -1260,11 +1572,6 @@ export default async function handler(req, res) {
               mainLineMarkets:
                 mainLineCombos,
 
-              /*
-               * Keep some other combos
-               * available so we can optimize
-               * nearby lines too.
-               */
               otherLineMarkets:
                 gameCombos
                   .filter(
@@ -1296,11 +1603,6 @@ export default async function handler(req, res) {
             },
           };
         })
-        .filter(
-          (game) =>
-            game.moneyline.length >
-            0
-        )
         .sort(
           (a, b) =>
             new Date(
@@ -1321,21 +1623,25 @@ export default async function handler(req, res) {
     }
 
     /*
-     * Optional combo order-book depth.
+     * STEP 6
+     *
+     * Optional order-book depth.
      */
     async function getOrderbook(
       ticker
     ) {
       const url =
         new URL(
-          `${BASE}/markets/${encodeURIComponent(
+          `${STANDARD_BASE}/markets/${encodeURIComponent(
             ticker
           )}/orderbook`
         );
 
       url.searchParams.set(
         "depth",
-        String(depthLevels)
+        String(
+          depthLevels
+        )
       );
 
       const response =
@@ -1351,7 +1657,8 @@ export default async function handler(req, res) {
 
       if (!response.ok) {
         return {
-          success: false,
+          success:
+            false,
 
           status:
             response.status,
@@ -1422,12 +1729,6 @@ export default async function handler(req, res) {
       const bestNoBid =
         noBids[0] || null;
 
-      /*
-       * Binary contract relationship:
-       *
-       * YES ask = 1 - best NO bid
-       * NO ask  = 1 - best YES bid
-       */
       const bestYesAsk =
         bestNoBid
           ? {
@@ -1461,7 +1762,8 @@ export default async function handler(req, res) {
           : null;
 
       return {
-        success: true,
+        success:
+          true,
 
         bestYesBid,
 
@@ -1477,60 +1779,6 @@ export default async function handler(req, res) {
       };
     }
 
-    async function mapWithConcurrency(
-      items,
-      concurrency,
-      fn
-    ) {
-      const results =
-        new Array(
-          items.length
-        );
-
-      let nextIndex = 0;
-
-      async function worker() {
-        while (true) {
-          const index =
-            nextIndex++;
-
-          if (
-            index >=
-            items.length
-          ) {
-            return;
-          }
-
-          results[index] =
-            await fn(
-              items[index],
-              index
-            );
-        }
-      }
-
-      const workerCount =
-        Math.min(
-          concurrency,
-          items.length
-        );
-
-      const workers =
-        Array.from(
-          {
-            length:
-              workerCount,
-          },
-          () => worker()
-        );
-
-      await Promise.all(
-        workers
-      );
-
-      return results;
-    }
-
     if (includeDepth) {
       const comboRefs = [];
 
@@ -1538,10 +1786,6 @@ export default async function handler(req, res) {
         const game of
           cleanGames
       ) {
-        /*
-         * Prioritize exact main-line
-         * combos.
-         */
         for (
           const combo of
             game.combos
@@ -1553,18 +1797,11 @@ export default async function handler(req, res) {
         }
       }
 
-      /*
-       * Protect the endpoint from
-       * accidental giant orderbook scans.
-       */
-      const limitedRefs =
+      await mapWithConcurrency(
         comboRefs.slice(
           0,
           40
-        );
-
-      await mapWithConcurrency(
-        limitedRefs,
+        ),
         6,
         async (combo) => {
           combo.orderbook =
@@ -1576,16 +1813,14 @@ export default async function handler(req, res) {
     }
 
     /*
-     * RAW DEBUG MODE
-     *
-     * Useful if combo matching is still
-     * not working.
+     * RAW DEBUG OUTPUT
      */
     if (rawMode) {
       return res
         .status(200)
         .json({
-          success: true,
+          success:
+            true,
 
           mode:
             "raw",
@@ -1593,61 +1828,65 @@ export default async function handler(req, res) {
           updatedAt:
             new Date().toISOString(),
 
-          comboDiscovery:
-            "GET /markets?mve_filter=only",
+          gameCount:
+            cleanGames.length,
 
-          mveWindow: {
-            minCloseTs,
-            maxCloseTs,
-          },
+          comboDiscoveryMethod:
+            "multivariate collections -> events/multivariate?collection_ticker=...&with_nested_markets=true",
 
-          counts: {
-            games:
-              cleanGames.length,
+          diagnostics: {
+            comboTargetGameCount:
+              comboTargetGames.length,
 
-            standardMarkets:
-              standardMarkets.length,
+            collectionTickerCount:
+              collectionTickers.length,
 
-            rawMVECount:
+            collectionTickers,
+
+            multivariateEventCount:
+              multivariateEventDiagnostics.length,
+
+            rawNestedComboMarketCount:
               comboMarkets.length,
 
-            mvePages:
-              mveResult.pages,
-
-            mveScanTruncated:
-              mveResult.truncated,
-
-            nflSameGameSpreadTotalCombos:
+            nflSameGameSpreadTotalComboCount:
               analyzedCombos.length,
           },
 
-          games:
-            cleanGames,
+          collectionLookups:
+            collectionLookupResults,
 
-          /*
-           * Sample raw MVE records so we
-           * can diagnose Kalshi's exact
-           * MVE payload without returning
-           * thousands of markets.
-           */
-          mveSample:
-            comboMarkets.slice(
+          multivariateEvents:
+            multivariateEventDiagnostics.slice(
               0,
-              100
+              500
             ),
 
-          analyzedCombos:
+          comboMarketSample:
+            comboMarkets.slice(
+              0,
+              200
+            ),
+
+          analyzedComboSample:
             analyzedCombos.slice(
               0,
               500
             ),
+
+          games:
+            cleanGames,
         });
     }
 
+    /*
+     * NORMAL OUTPUT
+     */
     return res
       .status(200)
       .json({
-        success: true,
+        success:
+          true,
 
         updatedAt:
           new Date().toISOString(),
@@ -1655,31 +1894,31 @@ export default async function handler(req, res) {
         gameCount:
           cleanGames.length,
 
-        comboDiscovery:
-          "GET /markets?mve_filter=only",
+        comboDiscoveryMethod:
+          "targeted multivariate collections",
 
-        rawMVECount:
+        collectionCount:
+          collectionTickers.length,
+
+        rawNestedComboMarketCount:
           comboMarkets.length,
 
         comboCount:
           analyzedCombos.length,
 
-        mvePages:
-          mveResult.pages,
-
-        mveScanTruncated:
-          mveResult.truncated,
-
         games:
           cleanGames,
       });
   } catch (error) {
-    console.error(error);
+    console.error(
+      error
+    );
 
     return res
       .status(500)
       .json({
-        success: false,
+        success:
+          false,
 
         error:
           error.message,
